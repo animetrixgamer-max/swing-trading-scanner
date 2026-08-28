@@ -22,7 +22,6 @@
 # Failed conditions are explicitly marked 🔴.
 # ============================================================
 
-!pip -q install yfinance openpyxl pandas lxml
 
 import streamlit as st
 import pandas as pd
