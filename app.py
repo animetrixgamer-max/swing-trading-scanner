@@ -20,7 +20,13 @@
 #   Score >= 90 + ALL technical conditions -> BUY
 #
 # Failed conditions are explicitly marked 🔴.
+#
+# EARNINGS:
+#   1. Yahoo Finance
+#   2. NSE Board Meeting fallback
+#   3. UNKNOWN if neither source provides a future date
 # ============================================================
+
 
 import streamlit as st
 import pandas as pd
@@ -30,6 +36,7 @@ import requests
 import io
 import math
 import time
+
 from datetime import datetime
 
 
@@ -80,6 +87,13 @@ NIFTY200_URL = (
     "https://www.niftyindices.com/"
     "IndexConstituent/ind_nifty200list.csv"
 )
+
+
+# ============================================================
+# NSE
+# ============================================================
+
+NSE_BASE_URL = "https://www.nseindia.com"
 
 
 # ============================================================
@@ -465,9 +479,6 @@ def get_nifty200_symbols():
 @st.cache_data(ttl=86400)
 def get_nifty50_symbols():
 
-    # Current NIFTY 50 constituent list
-    # from NSE indices page.
-
     url = (
         "https://www.niftyindices.com/"
         "IndexConstituent/ind_nifty50list.csv"
@@ -673,11 +684,6 @@ def add_indicators(df):
         )
         .mean()
     )
-
-    # Previous 20 completed sessions.
-    #
-    # Shift(1) prevents today's candle
-    # from being included.
 
     df["Previous20DHigh"] = (
         df["High"]
@@ -1087,10 +1093,6 @@ def scan_stock(symbol):
         "Max Hold":
             MAX_HOLDING_SESSIONS,
 
-        # ====================================================
-        # CONDITION COLUMNS
-        # ====================================================
-
         "Trend":
             trend_marker,
 
@@ -1118,17 +1120,253 @@ def scan_stock(symbol):
 
 
 # ============================================================
-# EARNINGS CHECK
+# NSE SESSION
+# ============================================================
+
+def create_nse_session():
+
+    session = requests.Session()
+
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36",
+
+        "Accept":
+            "application/json,text/plain,*/*",
+
+        "Accept-Language":
+            "en-US,en;q=0.9",
+
+        "Referer":
+            "https://www.nseindia.com/"
+    }
+
+    session.headers.update(
+        headers
+    )
+
+    return session
+
+
+# ============================================================
+# NSE EARNINGS / BOARD MEETING FALLBACK
 # ============================================================
 
 @st.cache_data(
     ttl=3600,
     show_spinner=False
 )
-def check_upcoming_earnings(
-    symbol,
-    days
-):
+def get_nse_earnings_dates(symbol):
+
+    try:
+
+        session = (
+            create_nse_session()
+        )
+
+        # ----------------------------------------------------
+        # Establish NSE session/cookies
+        # ----------------------------------------------------
+
+        session.get(
+            NSE_BASE_URL,
+            timeout=15
+        )
+
+        # ----------------------------------------------------
+        # NSE corporate board meeting endpoint
+        # ----------------------------------------------------
+
+        url = (
+            NSE_BASE_URL +
+            "/api/corporate-board-meetings"
+        )
+
+        params = {
+            "index": "equities",
+            "symbol": symbol
+        }
+
+        response = session.get(
+            url,
+            params=params,
+            timeout=20
+        )
+
+        if response.status_code != 200:
+
+            return []
+
+        data = response.json()
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            return []
+
+        records = (
+            data.get("data")
+            or []
+        )
+
+        if not isinstance(
+            records,
+            list
+        ):
+
+            return []
+
+        result_dates = []
+
+        for record in records:
+
+            if not isinstance(
+                record,
+                dict
+            ):
+
+                continue
+
+            purpose = str(
+                record.get(
+                    "purpose",
+                    ""
+                )
+            ).strip().lower()
+
+            meeting_date_raw = (
+                record.get(
+                    "meetingDate"
+                )
+                or
+                record.get(
+                    "meeting_date"
+                )
+                or
+                record.get(
+                    "meetingDateTime"
+                )
+            )
+
+            if not meeting_date_raw:
+
+                continue
+
+            # ------------------------------------------------
+            # Financial-results related meetings only
+            # ------------------------------------------------
+
+            result_keywords = [
+
+                "financial results",
+
+                "financial result",
+
+                "quarterly results",
+
+                "audited results",
+
+                "unaudited results",
+
+                "financial statements",
+
+                "results"
+            ]
+
+            is_result_meeting = any(
+                keyword in purpose
+                for keyword
+                in result_keywords
+            )
+
+            if not is_result_meeting:
+
+                continue
+
+            # ------------------------------------------------
+            # Parse date
+            # ------------------------------------------------
+
+            try:
+
+                meeting_date = pd.to_datetime(
+                    meeting_date_raw,
+                    errors="coerce"
+                )
+
+            except Exception:
+
+                continue
+
+            if pd.isna(meeting_date):
+
+                continue
+
+            # ------------------------------------------------
+            # Remove timezone
+            # ------------------------------------------------
+
+            try:
+
+                if (
+                    getattr(
+                        meeting_date,
+                        "tzinfo",
+                        None
+                    )
+                    is not None
+                ):
+
+                    meeting_date = (
+                        meeting_date
+                        .tz_localize(None)
+                    )
+
+            except Exception:
+
+                pass
+
+            meeting_date = (
+                meeting_date
+                .normalize()
+            )
+
+            result_dates.append(
+                meeting_date
+            )
+
+        # ----------------------------------------------------
+        # Remove duplicates
+        # ----------------------------------------------------
+
+        result_dates = list(
+            dict.fromkeys(
+                result_dates
+            )
+        )
+
+        return result_dates
+
+    except Exception:
+
+        return []
+
+
+# ============================================================
+# YAHOO EARNINGS
+# ============================================================
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False
+)
+def get_yahoo_earnings_dates(symbol):
 
     try:
 
@@ -1149,24 +1387,9 @@ def check_upcoming_earnings(
             earnings.empty
         ):
 
-            return {
-                "Earnings Status":
-                    "🟠 UNKNOWN",
+            return []
 
-                "Earnings Date":
-                    "N/A",
-
-                "Days Until Earnings":
-                    "N/A"
-            }
-
-        today = (
-            pd.Timestamp
-            .now()
-            .normalize()
-        )
-
-        future_dates = []
+        result_dates = []
 
         for date in earnings.index:
 
@@ -1176,7 +1399,10 @@ def check_upcoming_earnings(
                     pd.Timestamp(date)
                 )
 
-                if earnings_date.tzinfo:
+                if (
+                    earnings_date.tzinfo
+                    is not None
+                ):
 
                     earnings_date = (
                         earnings_date
@@ -1188,62 +1414,185 @@ def check_upcoming_earnings(
                     .normalize()
                 )
 
-                if earnings_date >= today:
-
-                    future_dates.append(
-                        earnings_date
-                    )
+                result_dates.append(
+                    earnings_date
+                )
 
             except Exception:
 
                 continue
 
-        if not future_dates:
-
-            return {
-                "Earnings Status":
-                    "🟠 UNKNOWN",
-
-                "Earnings Date":
-                    "N/A",
-
-                "Days Until Earnings":
-                    "N/A"
-            }
-
-        next_earnings = min(
-            future_dates
+        return list(
+            dict.fromkeys(
+                result_dates
+            )
         )
 
-        days_until = (
-            next_earnings -
-            today
-        ).days
+    except Exception:
 
-        if days_until <= days:
+        return []
 
-            status = (
-                "🔴 WITHIN WINDOW"
+
+# ============================================================
+# MAIN EARNINGS CHECK
+# ============================================================
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False
+)
+def check_upcoming_earnings(
+    symbol,
+    days
+):
+
+    try:
+
+        today = (
+            pd.Timestamp.now()
+            .normalize()
+        )
+
+        # ====================================================
+        # 1. TRY YAHOO FIRST
+        # ====================================================
+
+        yahoo_dates = (
+            get_yahoo_earnings_dates(
+                symbol
+            )
+        )
+
+        yahoo_future = [
+
+            d
+
+            for d in yahoo_dates
+
+            if d >= today
+        ]
+
+        if yahoo_future:
+
+            next_earnings = min(
+                yahoo_future
             )
 
-        else:
-
-            status = (
-                "🟢 CLEAR"
+            days_until = int(
+                (
+                    next_earnings -
+                    today
+                ).days
             )
+
+            if days_until <= days:
+
+                status = (
+                    "🔴 WITHIN WINDOW"
+                )
+
+            else:
+
+                status = (
+                    "🟢 CLEAR"
+                )
+
+            return {
+
+                "Earnings Status":
+                    status,
+
+                "Earnings Date":
+                    next_earnings.strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "Days Until Earnings":
+                    days_until,
+
+                "Earnings Source":
+                    "Yahoo Finance"
+            }
+
+        # ====================================================
+        # 2. YAHOO FAILED
+        #    TRY NSE
+        # ====================================================
+
+        nse_dates = (
+            get_nse_earnings_dates(
+                symbol
+            )
+        )
+
+        nse_future = [
+
+            d
+
+            for d in nse_dates
+
+            if d >= today
+        ]
+
+        if nse_future:
+
+            next_earnings = min(
+                nse_future
+            )
+
+            days_until = int(
+                (
+                    next_earnings -
+                    today
+                ).days
+            )
+
+            if days_until <= days:
+
+                status = (
+                    "🔴 WITHIN WINDOW"
+                )
+
+            else:
+
+                status = (
+                    "🟢 CLEAR"
+                )
+
+            return {
+
+                "Earnings Status":
+                    status,
+
+                "Earnings Date":
+                    next_earnings.strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "Days Until Earnings":
+                    days_until,
+
+                "Earnings Source":
+                    "NSE Board Meeting"
+            }
+
+        # ====================================================
+        # 3. NOTHING FOUND
+        # ====================================================
 
         return {
 
             "Earnings Status":
-                status,
+                "🟠 UNKNOWN",
 
             "Earnings Date":
-                next_earnings.strftime(
-                    "%Y-%m-%d"
-                ),
+                "N/A",
 
             "Days Until Earnings":
-                days_until
+                "N/A",
+
+            "Earnings Source":
+                "Unavailable"
         }
 
     except Exception:
@@ -1257,7 +1606,10 @@ def check_upcoming_earnings(
                 "N/A",
 
             "Days Until Earnings":
-                "N/A"
+                "N/A",
+
+            "Earnings Source":
+                "Unavailable"
         }
 
 
@@ -1516,12 +1868,6 @@ if run_scanner:
 
     # ========================================================
     # CANDIDATES
-    #
-    # IMPORTANT:
-    # Candidate = score >= 80
-    #
-    # It does NOT have to satisfy every condition.
-    # This allows us to see developing setups.
     # ========================================================
 
     candidates = (
@@ -1883,6 +2229,8 @@ if run_scanner:
 
             "Days Until Earnings",
 
+            "Earnings Source",
+
             "FINAL DECISION"
         ]
 
@@ -1946,6 +2294,9 @@ if run_scanner:
                         "Actual Risk",
                         "2R Target",
                         "Score",
+                        "Earnings Date",
+                        "Days Until Earnings",
+                        "Earnings Source",
                         "FINAL DECISION"
                     ]
                 ],
@@ -1998,6 +2349,9 @@ if run_scanner:
                         "Entry Extension",
                         "Score",
                         "Technical Status",
+                        "Earnings Date",
+                        "Days Until Earnings",
+                        "Earnings Source",
                         "FINAL DECISION"
                     ]
                 ],
@@ -2054,10 +2408,6 @@ if run_scanner:
             "%Y-%m-%d_%H-%M-%S"
         )
     )
-
-    # --------------------------------------------------------
-    # Final Candidates Excel
-    # --------------------------------------------------------
 
     candidates_buffer = io.BytesIO()
 
@@ -2149,8 +2499,10 @@ if run_scanner:
     )
 
     st.caption(
-        "Data source: Yahoo Finance. "
+        "Technical data source: Yahoo Finance. "
         "Technical indicators are calculated locally "
         "from downloaded historical OHLCV data. "
-        "Last completed daily candle is used."
+        "Last completed daily candle is used. "
+        "Earnings source: Yahoo Finance with NSE "
+        "Board Meeting fallback."
     )
