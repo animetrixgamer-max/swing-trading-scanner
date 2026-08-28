@@ -22,7 +22,6 @@
 # Failed conditions are explicitly marked 🔴.
 # ============================================================
 
-
 import streamlit as st
 import pandas as pd
 import numpy as np
